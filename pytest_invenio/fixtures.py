@@ -570,31 +570,37 @@ def db(database, db_session_options):
     from flask_sqlalchemy.session import Session as FlaskSQLAlchemySession
 
     from pytest_invenio.database_tools import (
-        purge_database_values,
+        check_database_values,
         store_database_values,
     )
 
     class PytestInvenioSession(FlaskSQLAlchemySession):
+        _test_container_transaction = None
+
         def get_bind(self, mapper=None, clause=None, bind=None, **kwargs):
             if self.bind:
                 return self.bind
             return super().get_bind(mapper=mapper, clause=clause, bind=bind, **kwargs)
 
-        def rollback(self) -> None:
-            if self._transaction is None:
-                pass
-            else:
-                self._transaction.rollback(_to_root=False)
+        def rollback(self, start_new_nested=True) -> None:
+            assert self._nested_transaction is not None
+            self._nested_transaction.rollback(_to_root=False)
+            if (
+                start_new_nested
+                and self._nested_transaction is self._test_container_transaction
+            ):
+                self.begin_nested()
 
-    # the session.rollback() does not always clean everything, if the test
-    # used db.session.commit() and has not cleaned up after itself. We can not
-    # use nested transactions because a lot of Invenio code would need to be updated
-    # so that it is aware of the nested transaction concept. Instead, we store
-    # the database values here and purge any new rows after the test.
-    #
-    # We do it in explicit connection to avoid issues in tests that drop all tables
-    # (causes deadlock in alembic tests of invenio-pages on github actions, not
-    # reproducible locally).
+        def commit(self, start_new_nested=True) -> None:
+            # flush objects to the database instead of the committing the transaction
+            assert self._nested_transaction is not None
+            self._nested_transaction.commit(_to_root=False)
+            if (
+                start_new_nested
+                and self._nested_transaction is self._test_container_transaction
+            ):
+                self.begin_nested()
+
     with database.engine.connect() as connection:
         with connection.begin():
             stored_values = store_database_values(database.engine, connection)
@@ -610,18 +616,42 @@ def db(database, db_session_options):
             )
 
             session = database._make_scoped_session(options=options)
+            test_session = session._proxied
 
             old_session = database.session
             database.session = session
 
+            # wrapping the session with two nested transactions:
+            # the outer one to detect any accidental out-of-nesting commits/rollbacks
+            # the inner one to work as a session context for the test
+            test_session._test_container_transaction = external_nested = (
+                session.begin_nested()
+            )
+
+            _internal_nested = session.begin_nested()
+
             yield database
 
-            session.rollback()
-            database.session = old_session
+            try:
+                # rollback the inner transaction - we need to call it on the protected
+                # nested transaction so that a new nested transaction is not started
+                test_session.rollback(start_new_nested=False)
+
+                # check the outer transaction - if it is not active, the test
+                # did something unexpected which lead to the outer transaction
+                # being closed
+                assert test_session._nested_transaction is external_nested
+
+                # rollback the outer transaction and do not start a new one
+                test_session.rollback(start_new_nested=False)
+            except:
+                raise
+            finally:
+                database.session = old_session
 
     # use a brand new connection for the purge operation
     with database.engine.connect() as connection:
-        purge_database_values(database.engine, connection, stored_values)
+        check_database_values(database.engine, connection, stored_values)
 
     # expire all as there might be some stale data in the original database session
     database.session.expire_all()

@@ -5,10 +5,6 @@ from sqlalchemy import MetaData, String, and_, func, select
 logger = logging.getLogger(__name__)
 
 
-class InconsistentDatabaseError(Exception):
-    pass
-
-
 def store_database_values(engine, conn):
     """Introspect the session, get all the tables and store their primary key values.
 
@@ -42,14 +38,14 @@ def store_database_values(engine, conn):
     return dump
 
 
-def purge_database_values(engine, conn, stored_values):
-    """Delete rows that are not in the stored values."""
+def check_database_values(engine, conn, stored_values):
+    """Check that only the stored_values are present in the database."""
 
     metadata = MetaData()
     metadata.reflect(engine)
 
     # Build a list of (table_name, delete_condition) tuples
-    to_be_deleted = []
+    to_be_checked = []
 
     for table_name, table in metadata.tables.items():
         stored_rows = stored_values.get(table_name, [])
@@ -84,73 +80,22 @@ def purge_database_values(engine, conn, stored_values):
 
         if row_matcher_conditions:
             non_matching_condition = and_(*row_matcher_conditions)
-            to_be_deleted.append(
+            to_be_checked.append(
                 (table_name, table, non_matching_condition, len(stored_pk_set))
             )
         else:
             # delete everything
-            to_be_deleted.append((table_name, table, None, len(stored_pk_set)))
+            to_be_checked.append((table_name, table, None, len(stored_pk_set)))
 
     # Try to delete rows with retry mechanism for foreign key constraints
-    while to_be_deleted:
-        failed_deletions = []
+    for table_name, table, where_condition, expected_count in to_be_checked:
+        # Execute deletion in a transaction so that we can rollback on failure
+        with conn.begin():
+            check_stmt = select(func.count()).select_from(table)
+            if where_condition is not None:
+                check_stmt = check_stmt.where(where_condition)
 
-        for table_name, table, where_condition, expected_count in to_be_deleted:
-            # Execute deletion in a transaction so that we can rollback on failure
-            with conn.begin():
-                try:
-                    delete_stmt = table.delete()
-                    if where_condition is not None:
-                        delete_stmt = delete_stmt.where(where_condition)
-
-                    conn.execute(delete_stmt)
-
-                    existing_count = conn.execute(
-                        select(func.count()).select_from(table)
-                    ).scalar()
-                    conn.commit()
-                    if expected_count > existing_count:
-
-                        where_str = where_condition.compile(
-                            dialect=conn.dialect,
-                            compile_kwargs={"literal_binds": True},
-                        )
-
-                        raise InconsistentDatabaseError(
-                            f"Expected to have {expected_count} rows in table {table_name} "
-                            f"in test cleanup but only {existing_count} remain after the test. "
-                            f"The test must have removed rows from module-level fixtures, "
-                            f"thus making the database inconsistent for subsequent tests."
-                            f"The conditions for rows: {where_str}"
-                        )
-                    logger.debug(
-                        "Deleted rows from table: %s, expected: %s, remaining: %s",
-                        table_name,
-                        expected_count,
-                        existing_count,
-                    )
-                    if existing_count != expected_count:
-                        logger.warning(
-                            "Not all rows deleted as expected, will try again."
-                        )
-                        failed_deletions.append(
-                            (table_name, table, where_condition, expected_count)
-                        )
-                except InconsistentDatabaseError:
-                    # Reraise as the database is in an inconsistent state which can not be fixed
-                    raise
-                except Exception:
-                    # Rollback on failure and retry in next iteration
-                    conn.rollback()
-                    failed_deletions.append(
-                        (table_name, table, where_condition, expected_count)
-                    )
-
-        if len(failed_deletions) == len(to_be_deleted):
-            table_names = [table_name for table_name, _, _, _ in failed_deletions]
-            raise RuntimeError(
-                f"Could not delete the remaining rows due to foreign key cycles in tables: {table_names}"
-            )
-        else:
-            # Update the list with failed deletions for next iteration
-            to_be_deleted = failed_deletions
+            count = conn.execute(check_stmt).scalar_one()
+            assert (
+                count == 0
+            ), "Commit within transaction has not worked, extra rows found."
