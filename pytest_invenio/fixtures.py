@@ -447,14 +447,13 @@ def _search_delete_indexes(current_search):
     list(current_search.delete(ignore=[404]))
 
 
-class SearchCache:
-    """Cache for search indices.
+class SearchManager:
+    """Manager for search indices.
 
-    The current implementation is simple - if the cache is not initialized,
-    it will initialize itself by creating all registered indexes.
-
-    We need to be more careful if there are any invenio packages that would
-    register different indexes in different test packages.
+    A class that holds a search client and manages search indices.
+    Its ``initialize`` method is supposed to be called in a
+    module-scope fixture. If it has not been initialized or if
+    entry points have changed, it will drop and reinitialize the indices.
     """
 
     def __init__(self):
@@ -462,34 +461,29 @@ class SearchCache:
         self.client = None
         self._entry_points = None
 
-    def initialize(self):
-        self._check_entry_points()
-        if not self.initialized:
-            self._initialize()
-            self.initialized = True
+    def initialize(self, current_search, current_search_client):
+        entry_points_changed = self._entry_points_changed()
+        if entry_points_changed or not self.initialized:
+            self._initialize(current_search, current_search_client, drop_existing=entry_points_changed)
 
-    def _check_entry_points(self):
-        mapping_entry_points = tuple(
-            ep for ep in importlib.metadata.entry_points(group="invenio_search.mappings")
+    def _entry_points_changed(self):
+        orig_entry_points = self._entry_points
+        self._entry_points = tuple(
+            ep for ep in sorted(importlib.metadata.entry_points(group="invenio_search.mappings"), key=lambda ep: ep.name)
         )
-        if mapping_entry_points != self._entry_points:
-            if self._entry_points:
-                from invenio_search import current_search
-                _search_delete_indexes(current_search)
-            self._entry_points = mapping_entry_points
-            self.initialized = False
+        return orig_entry_points and self._entry_points != orig_entry_points
 
-    def _initialize(self, drop_existing=False):
+    def _initialize(self, current_search, current_search_client, drop_existing=False):
         """This method needs to be called from module-level fixtures."""
-        from invenio_search import current_search, current_search_client
-
-        if drop_existing:
-            _search_delete_indexes(current_search)
-
-        _search_create_indexes(current_search, current_search_client)
-
         # note: using the real client instead of the lazy proxy
         self.client = current_search.client
+
+        if drop_existing:
+            self.destroy()
+
+        _search_create_indexes(current_search, current_search_client)
+        self.initialized = True
+
 
     def delete_all_documents(self):
         """Empty the search index."""
@@ -504,6 +498,8 @@ class SearchCache:
                 conflicts="proceed",
                 ignore=[404],
             )
+            # really delete the documents
+            self.client.indices.forcemerge(index="_all")
 
             # # Assert that all indices are empty
             # count_result = self.client.count(index="*", ignore=[404])
@@ -515,12 +511,11 @@ class SearchCache:
     def destroy(self):
         if self.client is not None:
             self.client.indices.delete("*", ignore=[404])
-            self.client = None
             self.initialized = False
 
 
 # this can not be a fixture as pytest does not allow mixing session and module fixtures
-search_cache = SearchCache()
+search_cache = SearchManager()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -549,7 +544,7 @@ def search(appctx):
     """
     from invenio_search import current_search, current_search_client
 
-    search_cache.initialize()
+    search_cache.initialize(current_search, current_search_client)
     yield current_search_client
     search_cache.delete_all_documents()
 
@@ -573,8 +568,6 @@ def search_clear(search):
     This fixture rollback any changes performed to the indexes during a test,
     in order to leave search in a clean state for the next test.
     """
-    from invenio_search import current_search, current_search_client
-
     yield search
     search_cache.delete_all_documents()
 
