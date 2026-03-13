@@ -52,6 +52,7 @@ from .fixtures import (  # noqa
     mailbox,
     script_info,
     search,
+    search_cleanup,
     search_clear,
     search_hosts,
     set_app_config_fn_scoped,

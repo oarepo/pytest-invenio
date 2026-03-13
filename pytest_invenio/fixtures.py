@@ -447,22 +447,124 @@ def _search_delete_indexes(current_search):
     list(current_search.delete(ignore=[404]))
 
 
+class SearchCache:
+    """Cache for search indices.
+
+    The current implementation is simple - if the cache is not initialized,
+    it will initialize itself by creating all registered indexes.
+
+    We need to be more careful if there are any invenio packages that would
+    register different indexes in different test packages.
+    """
+
+    def __init__(self):
+        self.initialized = False
+        self.client = None
+
+    def initialize(self):
+        if not self.initialized:
+            self._initialize()
+            self.initialized = True
+
+    def reinitialize(self):
+        self._initialize(drop_existing=True)
+        self.initialized = True
+
+    def _initialize(self, drop_existing=False):
+        """This method needs to be called from module-level fixtures."""
+        from invenio_search import current_search, current_search_client
+
+        if drop_existing:
+            _search_delete_indexes(current_search)
+
+        _search_create_indexes(current_search, current_search_client)
+
+        # note: using the real client instead of the lazy proxy
+        self.client = current_search.client
+
+    def delete_all_documents(self):
+        """Empty the search index."""
+        if self.client is not None:
+            try:
+                self.client.indices.refresh()
+                self.client.delete_by_query(
+                    index="_all",
+                    body={"query": {"match_all": {}}},
+                    slices="auto",
+                    refresh=True,
+                    wait_for_completion=True,
+                    conflicts="proceed",
+                    ignore=[404],
+                )
+
+                # # Assert that all indices are empty
+                # count_result = self.client.count(index="*", ignore=[404])
+                # doc_count = count_result.get("count", 0)
+                # assert doc_count == 0, (
+                #     f"Expected 0 documents in all indices, but found {doc_count}"
+                # )
+
+            except:
+                import traceback
+
+                traceback.print_exc()
+                raise
+
+    def destroy(self):
+        if self.client is not None:
+            self.client.indices.delete("*", ignore=[404])
+            self.client = None
+            self.initialized = False
+
+
+# this can not be a fixture as pytest does not allow mixing session and module fixtures
+search_cache = SearchCache()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def search_cleanup():
+    """Clean all created search indices.
+
+    This fixture will delete all registered indexes in search once
+    all tests have been run.
+    """
+    yield
+    # as this is a session-scoped fixture, we can not depend on any module-scoped fixtures.
+    # that is why we need to store the client in the cache and destroy it here
+    search_cache.destroy()
+
+
 @pytest.fixture(scope="module")
 def search(appctx):
-    """Setup and teardown all registered search indices.
+    """Clean all registered search indices.
 
     Scope: module
 
-    This fixture will create all registered indexes in search and remove
-    once done. Fixtures that perform changes (e.g. index or remove documents),
-    should used the function-scoped :py:data:`search_clear` fixture to leave the
+    This fixture will clear all registered indexes in search after the test
+    module finishes. Fixtures that perform changes (e.g. index or remove documents),
+    should use the function-scoped :py:data:`search_clear` fixture to leave the
     indexes clean for the following tests.
     """
     from invenio_search import current_search, current_search_client
 
-    _search_create_indexes(current_search, current_search_client)
+    search_cache.initialize()
     yield current_search_client
-    _search_delete_indexes(current_search)
+    search_cache.delete_all_documents()
+
+@pytest.fixture(scope="module")
+def search_reinit(appctx):
+    """Remove all indices and recreate them before the test module starts.
+
+    Scope: module
+
+    This fixture will remove all registered indexes and recreate them before
+    the test module starts. Normally there is no need to use this fixture.
+    The only exception is when the module modifies the search configuration
+    (such as adding new indexes or changing mappings). In that case, please create
+    a module-scoped autouse fixture that uses this one in your test module.
+    """
+    search_cache.reinitialize()
+    yield search
 
 
 @pytest.fixture(scope="module")
@@ -487,8 +589,7 @@ def search_clear(search):
     from invenio_search import current_search, current_search_client
 
     yield search
-    _search_delete_indexes(current_search)
-    _search_create_indexes(current_search, current_search_client)
+    search_cache.delete_all_documents()
 
 
 @pytest.fixture(scope="function")
