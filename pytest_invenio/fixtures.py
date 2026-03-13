@@ -460,15 +460,24 @@ class SearchCache:
     def __init__(self):
         self.initialized = False
         self.client = None
+        self._entry_points = None
 
     def initialize(self):
+        self._check_entry_points()
         if not self.initialized:
             self._initialize()
             self.initialized = True
 
-    def reinitialize(self):
-        self._initialize(drop_existing=True)
-        self.initialized = True
+    def _check_entry_points(self):
+        mapping_entry_points = tuple(
+            ep for ep in importlib.metadata.entry_points(group="invenio_search.mappings")
+        )
+        if mapping_entry_points != self._entry_points:
+            if self._entry_points:
+                from invenio_search import current_search
+                _search_delete_indexes(current_search)
+            self._entry_points = mapping_entry_points
+            self.initialized = False
 
     def _initialize(self, drop_existing=False):
         """This method needs to be called from module-level fixtures."""
@@ -485,30 +494,23 @@ class SearchCache:
     def delete_all_documents(self):
         """Empty the search index."""
         if self.client is not None:
-            try:
-                self.client.indices.refresh()
-                self.client.delete_by_query(
-                    index="_all",
-                    body={"query": {"match_all": {}}},
-                    slices="auto",
-                    refresh=True,
-                    wait_for_completion=True,
-                    conflicts="proceed",
-                    ignore=[404],
-                )
+            self.client.indices.refresh()
+            self.client.delete_by_query(
+                index="_all",
+                body={"query": {"match_all": {}}},
+                slices="auto",
+                refresh=True,
+                wait_for_completion=True,
+                conflicts="proceed",
+                ignore=[404],
+            )
 
-                # # Assert that all indices are empty
-                # count_result = self.client.count(index="*", ignore=[404])
-                # doc_count = count_result.get("count", 0)
-                # assert doc_count == 0, (
-                #     f"Expected 0 documents in all indices, but found {doc_count}"
-                # )
-
-            except:
-                import traceback
-
-                traceback.print_exc()
-                raise
+            # # Assert that all indices are empty
+            # count_result = self.client.count(index="*", ignore=[404])
+            # doc_count = count_result.get("count", 0)
+            # assert doc_count == 0, (
+            #     f"Expected 0 documents in all indices, but found {doc_count}"
+            # )
 
     def destroy(self):
         if self.client is not None:
@@ -550,21 +552,6 @@ def search(appctx):
     search_cache.initialize()
     yield current_search_client
     search_cache.delete_all_documents()
-
-@pytest.fixture(scope="module")
-def search_reinit(appctx):
-    """Remove all indices and recreate them before the test module starts.
-
-    Scope: module
-
-    This fixture will remove all registered indexes and recreate them before
-    the test module starts. Normally there is no need to use this fixture.
-    The only exception is when the module modifies the search configuration
-    (such as adding new indexes or changing mappings). In that case, please create
-    a module-scoped autouse fixture that uses this one in your test module.
-    """
-    search_cache.reinitialize()
-    yield search
 
 
 @pytest.fixture(scope="module")
