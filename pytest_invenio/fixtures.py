@@ -467,6 +467,7 @@ class SearchManager:
         self.client = None
         self._entry_points = None
         self._indices = {}
+        self._recreated_indices = set()
 
     def initialize(self, current_search, current_search_client):
         entry_points_changed = self._entry_points_changed()
@@ -497,27 +498,44 @@ class SearchManager:
         _search_create_indexes(current_search, current_search_client)
         self.initialized = True
         self.client = current_search.client
-        # some indices can be reused, because documents are not keyed by
-        # uuid, but by reusing the same idx (like users-user, where the id
+        # some indices can not be reused, because documents are not keyed by
+        # uuid but by reusing the same idx (like users-user, where the id
         # of the document is incremented integer). Unfortunately, opensearch
         # keeps an internal version that is not reset when a document is deleted,
         # breaking optimistic concurrency built in invenio. For these indices,
         # we delete and recreate them on each run.
+        #
+        # Here we get their definitions to be used later on.
         self._indices = {}
         for index in self.client.indices.get_alias("*"):
-            if any(index.startswith(k) for k in self.needs_recreating):
+            matching_recreating_indices = [
+                k for k in self.needs_recreating if index.startswith(k)
+            ]
+            if matching_recreating_indices:
                 # get index definition
+                if len(matching_recreating_indices) > 1:
+                    raise ValueError(
+                        f"Multiple matching indices for {index}: {matching_recreating_indices}"
+                    )
                 definition = self.client.indices.get(index=index)[index]
                 definition["settings"]["index"].pop("creation_date", None)
                 definition["settings"]["index"].pop("provided_name", None)
                 definition["settings"]["index"].pop("uuid", None)
                 definition["settings"]["index"].pop("version", None)
-                self._indices[index] = definition
+                self._indices[matching_recreating_indices[0]] = definition
 
     def delete_all_documents(self):
         """Empty the search index."""
         if self.client is not None:
             self.client.indices.refresh()
+
+            indices_to_recreate = []
+            for idx in self._indices:
+                # get count of documents in index
+                count = self.client.count(index=idx)["count"]
+                if count > 0:
+                    indices_to_recreate.append(idx)
+
             self.client.delete_by_query(
                 index="_all",
                 body={"query": {"match_all": {}}},
@@ -528,11 +546,23 @@ class SearchManager:
                 ignore=[404],
             )
 
-            # for each index that needs recreating, delete it
-            for index, definition in self._indices.items():
-                # delete and recreate the index with the same definition
-                self.client.indices.delete(index=index, ignore=[404])
-                self.client.indices.create(index=index, body=definition)
+            if indices_to_recreate:
+                self.client.indices.refresh()
+
+                # for each index that needs recreating, delete it
+                for index in self.client.indices.get_alias("*"):
+                    matching_recreating_indices = [
+                        k for k in indices_to_recreate if index.startswith(k)
+                    ]
+                    if matching_recreating_indices:
+                        # delete and recreate the index with the same definition
+                        self.client.indices.delete(index=index, ignore=[404])
+                        self.client.indices.create(
+                            index=index,
+                            body=self._indices[matching_recreating_indices[0]],
+                        )
+
+            self.client.indices.refresh()
 
     def destroy(self, client=None):
         client = client or self.client
@@ -560,7 +590,7 @@ def search_cleanup():
 
 
 @pytest.fixture(scope="module")
-def search(appctx):
+def search(request, appctx):
     """Clean all registered search indices.
 
     Scope: module
