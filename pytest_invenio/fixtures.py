@@ -456,7 +456,11 @@ class SearchManager:
     entry points have changed, it will drop and reinitialize the indices.
     """
 
-    needs_recreating = ["users-user"]
+    needs_recreating = [
+        "users-user-v3.0.0",
+        "domains-domain-v1.0.0",
+        "communities-communities-v2.0.0",
+    ]
 
     def __init__(self):
         self.initialized = False
