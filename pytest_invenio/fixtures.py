@@ -36,41 +36,47 @@ SCREENSHOT_SCRIPT = """import base64
 with open('screenshot.png', 'wb') as fp:
     fp.write(base64.b64decode('''{data}'''))
 """
+try:
+    from opensearchpy.exceptions import ConflictError
+    from opensearchpy.transport import Transport
 
-from opensearchpy.exceptions import ConflictError
-from opensearchpy.transport import Transport
+    class IfSeqNoRemovedTransport(Transport):
+        def perform_request(
+            self,
+            method: str,
+            url: str,
+            params=None,
+            body=None,
+            timeout=None,
+            ignore=(),
+            headers=None,
+        ):
+            if url == "/_bulk":
+                body = self.remove_version_type_from_bulk(body)
+                print(body)
+            try:
+                if params:
+                    params.pop("version", None)
+                    params.pop("version_type", None)
+                return super().perform_request(
+                    method, url, params, body, timeout, ignore, headers
+                )
+            except ConflictError:
+                print("Exception in perform_request", method, url, params)
+                raise
 
+        def remove_version_type_from_bulk(self, body):
+            lines = body.split("\n")
+            for i, line in enumerate(lines):
+                lines[i] = line.replace(
+                    ',"version":0,"version_type":"external_gte"', ""
+                )
+            return "\n".join(lines)
+except ImportError:
 
-class IfSeqNoRemovedTransport(Transport):
-    def perform_request(
-        self,
-        method: str,
-        url: str,
-        params=None,
-        body=None,
-        timeout=None,
-        ignore=(),
-        headers=None,
-    ):
-        if url == "/_bulk":
-            body = self.remove_version_type_from_bulk(body)
-            print(body)
-        try:
-            if params:
-                params.pop("version", None)
-                params.pop("version_type", None)
-            return super().perform_request(
-                method, url, params, body, timeout, ignore, headers
-            )
-        except ConflictError:
-            print("Exception in perform_request", method, url, params)
-            raise
-
-    def remove_version_type_from_bulk(self, body):
-        lines = body.split("\n")
-        for i, line in enumerate(lines):
-            lines[i] = line.replace(',"version":0,"version_type":"external_gte"', "")
-        return "\n".join(lines)
+    class IfSeqNoRemovedTransport:
+        def perform_request(self, *args, **kwargs):
+            raise ImportError("opensearchpy is not installed")
 
 
 @pytest.fixture(scope="module")
