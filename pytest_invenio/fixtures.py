@@ -36,47 +36,6 @@ SCREENSHOT_SCRIPT = """import base64
 with open('screenshot.png', 'wb') as fp:
     fp.write(base64.b64decode('''{data}'''))
 """
-try:
-    from opensearchpy.exceptions import ConflictError
-    from opensearchpy.transport import Transport
-
-    class IfSeqNoRemovedTransport(Transport):
-        def perform_request(
-            self,
-            method: str,
-            url: str,
-            params=None,
-            body=None,
-            timeout=None,
-            ignore=(),
-            headers=None,
-        ):
-            if url == "/_bulk":
-                body = self.remove_version_type_from_bulk(body)
-                print(body)
-            try:
-                if params:
-                    params.pop("version", None)
-                    params.pop("version_type", None)
-                return super().perform_request(
-                    method, url, params, body, timeout, ignore, headers
-                )
-            except ConflictError:
-                print("Exception in perform_request", method, url, params)
-                raise
-
-        def remove_version_type_from_bulk(self, body):
-            lines = body.split("\n")
-            for i, line in enumerate(lines):
-                lines[i] = line.replace(
-                    ',"version":0,"version_type":"external_gte"', ""
-                )
-            return "\n".join(lines)
-except ImportError:
-
-    class IfSeqNoRemovedTransport:
-        def perform_request(self, *args, **kwargs):
-            raise ImportError("opensearchpy is not installed")
 
 
 @pytest.fixture(scope="module")
@@ -317,7 +276,6 @@ def app_config(db_uri, broker_uri, celery_config_ext, search_hosts):
         # Theme
         APP_THEME=["semantic-ui"],
         THEME_ICONS=icons,
-        SEARCH_CLIENT_CONFIG={"transport_class": IfSeqNoRemovedTransport},
         **db_options,
     )
 
@@ -498,10 +456,13 @@ class SearchManager:
     entry points have changed, it will drop and reinitialize the indices.
     """
 
+    needs_recreating = ["users-user"]
+
     def __init__(self):
         self.initialized = False
         self.client = None
         self._entry_points = None
+        self._indices = {}
 
     def initialize(self, current_search, current_search_client):
         entry_points_changed = self._entry_points_changed()
@@ -532,6 +493,22 @@ class SearchManager:
         _search_create_indexes(current_search, current_search_client)
         self.initialized = True
         self.client = current_search.client
+        # some indices can be reused, because documents are not keyed by
+        # uuid, but by reusing the same idx (like users-user, where the id
+        # of the document is incremented integer). Unfortunately, opensearch
+        # keeps an internal version that is not reset when a document is deleted,
+        # breaking optimistic concurrency built in invenio. For these indices,
+        # we delete and recreate them on each run.
+        self._indices = {}
+        for index in self.client.indices.get_alias("*"):
+            if any(index.startswith(k) for k in self.needs_recreating):
+                # get index definition
+                definition = self.client.indices.get(index=index)[index]
+                definition["settings"]["index"].pop("creation_date", None)
+                definition["settings"]["index"].pop("provided_name", None)
+                definition["settings"]["index"].pop("uuid", None)
+                definition["settings"]["index"].pop("version", None)
+                self._indices[index] = definition
 
     def delete_all_documents(self):
         """Empty the search index."""
@@ -546,25 +523,12 @@ class SearchManager:
                 conflicts="proceed",
                 ignore=[404],
             )
-            # really delete the documents
-            # self.client.indices.forcemerge(index="_all")
 
-            # Force merge with expunge_deletes to physically remove deleted documents
-            self.client.indices.forcemerge(
-                index="_all",
-                max_num_segments=1,  # Consolidate to 1 segment
-                only_expunge_deletes=True,  # Specifically target deleted documents
-            )
-
-            # Refresh to make changes visible
-            self.client.indices.refresh(index="_all")
-
-            # # Assert that all indices are empty
-            # count_result = self.client.count(index="*", ignore=[404])
-            # doc_count = count_result.get("count", 0)
-            # assert doc_count == 0, (
-            #     f"Expected 0 documents in all indices, but found {doc_count}"
-            # )
+            # for each index that needs recreating, delete it
+            for index, definition in self._indices.items():
+                # delete and recreate the index with the same definition
+                self.client.indices.delete(index=index, ignore=[404])
+                self.client.indices.create(index=index, body=definition)
 
     def destroy(self, client=None):
         client = client or self.client
