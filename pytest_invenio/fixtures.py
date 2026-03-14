@@ -37,6 +37,41 @@ with open('screenshot.png', 'wb') as fp:
     fp.write(base64.b64decode('''{data}'''))
 """
 
+from opensearchpy.exceptions import ConflictError
+from opensearchpy.transport import Transport
+
+
+class IfSeqNoRemovedTransport(Transport):
+    def perform_request(
+        self,
+        method: str,
+        url: str,
+        params=None,
+        body=None,
+        timeout=None,
+        ignore=(),
+        headers=None,
+    ):
+        if url == "/_bulk":
+            body = self.remove_version_type_from_bulk(body)
+            print(body)
+        try:
+            if params:
+                params.pop("version", None)
+                params.pop("version_type", None)
+            return super().perform_request(
+                method, url, params, body, timeout, ignore, headers
+            )
+        except ConflictError:
+            print("Exception in perform_request", method, url, params)
+            raise
+
+    def remove_version_type_from_bulk(self, body):
+        lines = body.split("\n")
+        for i, line in enumerate(lines):
+            lines[i] = line.replace(',"version":0,"version_type":"external_gte"', "")
+        return "\n".join(lines)
+
 
 @pytest.fixture(scope="module")
 def default_handler():
@@ -276,6 +311,7 @@ def app_config(db_uri, broker_uri, celery_config_ext, search_hosts):
         # Theme
         APP_THEME=["semantic-ui"],
         THEME_ICONS=icons,
+        SEARCH_CLIENT_CONFIG={"transport_class": IfSeqNoRemovedTransport},
         **db_options,
     )
 
@@ -464,26 +500,32 @@ class SearchManager:
     def initialize(self, current_search, current_search_client):
         entry_points_changed = self._entry_points_changed()
         if entry_points_changed or not self.initialized:
-            self._initialize(current_search, current_search_client, drop_existing=entry_points_changed)
+            self._initialize(
+                current_search,
+                current_search_client,
+                drop_existing=entry_points_changed,
+            )
 
     def _entry_points_changed(self):
         orig_entry_points = self._entry_points
         self._entry_points = tuple(
-            ep for ep in sorted(importlib.metadata.entry_points(group="invenio_search.mappings"), key=lambda ep: ep.name)
+            ep
+            for ep in sorted(
+                importlib.metadata.entry_points(group="invenio_search.mappings"),
+                key=lambda ep: ep.name,
+            )
         )
         return orig_entry_points and self._entry_points != orig_entry_points
 
     def _initialize(self, current_search, current_search_client, drop_existing=False):
         """This method needs to be called from module-level fixtures."""
         # note: using the real client instead of the lazy proxy
-        self.client = current_search.client
-
         if drop_existing:
-            self.destroy()
+            self.destroy(current_search.client)
 
         _search_create_indexes(current_search, current_search_client)
         self.initialized = True
-
+        self.client = current_search.client
 
     def delete_all_documents(self):
         """Empty the search index."""
@@ -499,7 +541,17 @@ class SearchManager:
                 ignore=[404],
             )
             # really delete the documents
-            self.client.indices.forcemerge(index="_all")
+            # self.client.indices.forcemerge(index="_all")
+
+            # Force merge with expunge_deletes to physically remove deleted documents
+            self.client.indices.forcemerge(
+                index="_all",
+                max_num_segments=1,  # Consolidate to 1 segment
+                only_expunge_deletes=True,  # Specifically target deleted documents
+            )
+
+            # Refresh to make changes visible
+            self.client.indices.refresh(index="_all")
 
             # # Assert that all indices are empty
             # count_result = self.client.count(index="*", ignore=[404])
@@ -508,10 +560,12 @@ class SearchManager:
             #     f"Expected 0 documents in all indices, but found {doc_count}"
             # )
 
-    def destroy(self):
-        if self.client is not None:
-            self.client.indices.delete("*", ignore=[404])
-            self.initialized = False
+    def destroy(self, client=None):
+        client = client or self.client
+        if client is not None:
+            client.indices.delete("*", ignore=[404])
+        self.initialized = False
+        self.client = None
 
 
 # this can not be a fixture as pytest does not allow mixing session and module fixtures
